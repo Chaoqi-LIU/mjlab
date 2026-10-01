@@ -66,7 +66,13 @@ class TorchArray:
 
   def __setitem__(self, idx: Any, value: Any) -> None:
     """Set item(s) in the tensor using standard indexing."""
-    if self._is_cuda and self._torch_stream is not None:
+    # Inside a torch CUDA-graph capture the write must be recorded on the capturing
+    # stream; switching to Warp's stream would run it uncaptured, once, at capture.
+    if (
+      self._is_cuda
+      and self._torch_stream is not None
+      and not torch.cuda.is_current_stream_capturing()
+    ):
       with torch.cuda.stream(self._torch_stream):
         self._tensor[idx] = value
     else:

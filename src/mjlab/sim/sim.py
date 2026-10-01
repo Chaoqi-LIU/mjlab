@@ -339,6 +339,9 @@ class Simulation:
     self._data_bridge = WarpBridge(self._wp_data)
     self._sensor_context: SensorContext | None = None
 
+    # Bumped whenever the arrays behind a captured graph are replaced; an outer
+    # whole-step capture (see ``envs/graph.py``) refuses to replay across a change.
+    self.graph_epoch = 0
     self.use_cuda_graph = self._should_use_cuda_graph()
     self.create_graph()
 
@@ -358,6 +361,7 @@ class Simulation:
 
     On CPU devices or when memory pools are disabled, this is a no-op.
     """
+    self.graph_epoch += 1
     self.step_graph = None
     self.forward_graph = None
     self.reset_graph = None
@@ -482,15 +486,34 @@ class Simulation:
     with wp.ScopedDevice(self.wp_device):
       fn(self._wp_model, self._wp_data)
 
+  @property
+  def in_outer_capture(self) -> bool:
+    """Whether an enclosing torch CUDA-graph capture is recording this stream.
+
+    Warp graphs cannot be launched into such a capture from here; the Warp
+    kernels are launched directly instead and recorded by the outer graph (the
+    capture owner declares it to Warp with ``wp.capture_begin(external=True)``).
+    """
+    return self.wp_device.is_cuda and torch.cuda.is_current_stream_capturing()
+
   def forward(self) -> None:
     with wp.ScopedDevice(self.wp_device):
-      if self.use_cuda_graph and self.forward_graph is not None:
+      if (
+        self.use_cuda_graph
+        and self.forward_graph is not None
+        and not self.in_outer_capture
+      ):
         wp.capture_launch(self.forward_graph)
       else:
         mjwarp.forward(self.wp_model, self.wp_data)
 
   def step(self) -> None:
     with wp.ScopedDevice(self.wp_device):
+      if self.in_outer_capture:
+        if self.nan_guard.enabled:
+          raise RuntimeError("NanGuard is not supported inside a CUDA-graph capture")
+        mjwarp.step(self.wp_model, self.wp_data)
+        return
       with self.nan_guard.watch(self.data):
         if self.use_cuda_graph and self.step_graph is not None:
           wp.capture_launch(self.step_graph)
@@ -504,11 +527,27 @@ class Simulation:
       else:
         self._reset_mask.fill_(False)
         self._reset_mask[env_ids] = True
+      self._launch_reset()
 
-      if self.use_cuda_graph and self.reset_graph is not None:
-        wp.capture_launch(self.reset_graph)
-      else:
-        mjwarp.reset_data(self.wp_model, self.wp_data, reset=self._reset_mask_wp)
+  def reset_masked(self, mask: torch.Tensor) -> None:
+    """Reset the worlds selected by a boolean ``[num_envs]`` tensor, no host sync.
+
+    MuJoCo Warp's reset kernel is already masked per world, so this only copies
+    the mask; an all-false mask costs one tiny launch.
+    """
+    with wp.ScopedDevice(self.wp_device):
+      self._reset_mask.copy_(mask)
+      self._launch_reset()
+
+  def _launch_reset(self) -> None:
+    if (
+      self.use_cuda_graph
+      and self.reset_graph is not None
+      and not self.in_outer_capture
+    ):
+      wp.capture_launch(self.reset_graph)
+    else:
+      mjwarp.reset_data(self.wp_model, self.wp_data, reset=self._reset_mask_wp)
 
   def set_sensor_context(self, ctx: SensorContext) -> None:
     """Wire a SensorContext for camera/raycast sensing.
@@ -528,6 +567,8 @@ class Simulation:
     """
     if self._sensor_context is None:
       return
+    if self.in_outer_capture:
+      raise RuntimeError("Camera and raycast sensing is not supported in a CUDA-graph capture")
 
     ctx = self._sensor_context
     ctx.prepare()
