@@ -10,6 +10,7 @@ import torch
 from prettytable import PrettyTable
 
 from mjlab.managers.manager_base import ManagerBase, ManagerTermBaseCfg
+from mjlab.utils.masking import fill_rows_, mean_log
 
 if TYPE_CHECKING:
   from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
@@ -111,6 +112,19 @@ class RewardManager(ManagerBase):
       self._episode_sums[key][env_ids] = 0.0
     for term_cfg in self._class_term_cfgs:
       term_cfg.func.reset(env_ids=env_ids)
+    return extras
+
+  def reset_masked(
+    self, mask: torch.Tensor
+  ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    extras = {}
+    for key in self._episode_sums.keys():
+      extras["Episode_Reward/" + key] = mean_log(
+        self._episode_sums[key], mask, divisor=self._env.max_episode_length_s
+      )
+      fill_rows_(self._episode_sums[key], mask, 0.0)
+    for term_cfg in self._class_term_cfgs:
+      term_cfg.func.reset_masked(mask)
     return extras
 
   def compute(self, dt: float) -> torch.Tensor:

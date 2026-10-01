@@ -878,6 +878,16 @@ class Entity:
     for act in self._actuators:
       act.reset(env_ids)
 
+  def reset_masked(self, mask: torch.Tensor) -> None:
+    """``reset`` for the worlds selected by a boolean ``[num_envs]`` tensor.
+
+    Fixed shape and free of host synchronization, so it can be captured in a CUDA
+    graph; rows outside the mask are untouched.
+    """
+    self._data.clear_state_masked(mask)
+    for act in self._actuators:
+      act.reset_masked(mask)
+
   def clear_state(self, env_ids: torch.Tensor | slice | None = None) -> None:
     """Deprecated. Use ``reset`` instead."""
     warnings.warn(

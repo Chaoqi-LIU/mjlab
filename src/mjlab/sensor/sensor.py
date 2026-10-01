@@ -126,6 +126,19 @@ class Sensor(ABC, Generic[T]):
     """Invalidate the cached data, forcing recomputation on next access."""
     self._cache_valid = False
 
+  def reset_masked(self, mask: torch.Tensor) -> None:
+    """Reset sensor state for the worlds selected by a boolean ``[num_envs]`` mask.
+
+    Stateless sensors only invalidate the cache. A sensor that overrides ``reset``
+    must override this too, calling ``super().reset_masked(mask)`` first.
+    """
+    del mask
+    if type(self).reset is not Sensor.reset and type(self).reset_masked is Sensor.reset_masked:
+      raise NotImplementedError(
+        f"{type(self).__name__} does not support masked (CUDA-graph) resets"
+      )
+    self._invalidate_cache()
+
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
     """Reset sensor state for specified environments.
 

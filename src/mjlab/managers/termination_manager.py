@@ -99,6 +99,20 @@ class TerminationManager(ManagerBase):
       term_cfg.func.reset(env_ids=env_ids)
     return extras
 
+  def reset_masked(
+    self, mask: torch.Tensor
+  ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    extras = {}
+    valid = mask.any()
+    for key in self._term_dones.keys():
+      extras["Episode_Termination/" + key] = (
+        (self._term_dones[key] & mask).sum().float(),
+        valid,
+      )
+    for term_cfg in self._class_term_cfgs:
+      term_cfg.func.reset_masked(mask)
+    return extras
+
   def compute(self) -> torch.Tensor:
     self._truncated_buf[:] = False
     self._terminated_buf[:] = False

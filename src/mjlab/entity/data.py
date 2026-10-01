@@ -12,6 +12,7 @@ from mjlab.utils.lab_api.math import (
   quat_from_matrix,
   quat_mul,
 )
+from mjlab.utils.masking import EnvMask, fill_rows_, where_rows
 
 if TYPE_CHECKING:
   from mjlab.entity.entity import EntityIndexing
@@ -100,7 +101,7 @@ class EntityData:
     assert pose.shape[-1] == self.ROOT_POSE_DIM
 
     env_ids = self._resolve_env_ids(env_ids)
-    self.data.qpos[env_ids, self.indexing.free_joint_q_adr] = pose
+    self._put(self.data.qpos, env_ids, self.indexing.free_joint_q_adr, pose)
 
   def write_root_velocity(
     self, velocity: torch.Tensor, env_ids: torch.Tensor | slice | None = None
@@ -110,10 +111,10 @@ class EntityData:
     assert velocity.shape[-1] == self.ROOT_VEL_DIM
 
     env_ids = self._resolve_env_ids(env_ids)
-    quat_w = self.data.qpos[env_ids, self.indexing.free_joint_q_adr[3:7]]
+    quat_w = self._get(self.data.qpos, env_ids, self.indexing.free_joint_q_adr[3:7])
     ang_vel_b = quat_apply_inverse(quat_w, velocity[:, 3:])
     velocity_qvel = torch.cat([velocity[:, :3], ang_vel_b], dim=-1)
-    self.data.qvel[env_ids, self.indexing.free_joint_v_adr] = velocity_qvel
+    self._put(self.data.qvel, env_ids, self.indexing.free_joint_v_adr, velocity_qvel)
 
   def write_root_velocity_b(
     self, velocity_b: torch.Tensor, env_ids: torch.Tensor | slice | None = None
@@ -128,11 +129,11 @@ class EntityData:
     assert velocity_b.shape[-1] == self.ROOT_VEL_DIM
 
     env_ids = self._resolve_env_ids(env_ids)
-    quat_w = self.data.qpos[env_ids, self.indexing.free_joint_q_adr[3:7]]
+    quat_w = self._get(self.data.qpos, env_ids, self.indexing.free_joint_q_adr[3:7])
     lin_vel_w = quat_apply(quat_w, velocity_b[:, :3])
     # Free joint qvel holds world-frame linear and body-frame angular velocity.
     velocity_qvel = torch.cat([lin_vel_w, velocity_b[:, 3:]], dim=-1)
-    self.data.qvel[env_ids, self.indexing.free_joint_v_adr] = velocity_qvel
+    self._put(self.data.qvel, env_ids, self.indexing.free_joint_v_adr, velocity_qvel)
 
   def write_root_com_velocity(
     self, velocity: torch.Tensor, env_ids: torch.Tensor | slice | None = None
@@ -141,6 +142,8 @@ class EntityData:
       raise ValueError("Cannot write root COM velocity for fixed-base entity.")
     assert velocity.shape[-1] == self.ROOT_VEL_DIM
 
+    if isinstance(env_ids, EnvMask):
+      raise NotImplementedError("write_root_com_velocity does not accept an EnvMask")
     env_ids = env_ids if env_ids is not None else slice(None)
     com_offset_b = self.model.body_ipos[:, self.indexing.root_body_id]
     quat_w = self.data.qpos[:, self.indexing.free_joint_q_adr[3:7]][env_ids]
@@ -176,7 +179,7 @@ class EntityData:
     env_ids = self._resolve_env_ids(env_ids)
     joint_ids = joint_ids if joint_ids is not None else slice(None)
     q_slice = self.indexing.joint_q_adr[joint_ids]
-    self.data.qpos[env_ids, q_slice] = position
+    self._put(self.data.qpos, env_ids, q_slice, position)
 
   def write_joint_velocity(
     self,
@@ -190,7 +193,7 @@ class EntityData:
     env_ids = self._resolve_env_ids(env_ids)
     joint_ids = joint_ids if joint_ids is not None else slice(None)
     v_slice = self.indexing.joint_v_adr[joint_ids]
-    self.data.qvel[env_ids, v_slice] = velocity
+    self._put(self.data.qvel, env_ids, v_slice, velocity)
 
   def write_external_wrench(
     self,
@@ -232,7 +235,10 @@ class EntityData:
     self.data.mocap_pos[env_ids, self.indexing.mocap_id] = pose[:, 0:3].unsqueeze(1)
     self.data.mocap_quat[env_ids, self.indexing.mocap_id] = pose[:, 3:7].unsqueeze(1)
 
-  def clear_state(self, env_ids: torch.Tensor | slice | None = None) -> None:
+  def clear_state(self, env_ids: torch.Tensor | slice | EnvMask | None = None) -> None:
+    if isinstance(env_ids, EnvMask):
+      self.clear_state_masked(env_ids.mask)
+      return
     if self.is_actuated:
       env_ids = self._resolve_env_ids(env_ids)
       self.joint_pos_target[env_ids] = 0.0
@@ -243,15 +249,53 @@ class EntityData:
       self.tendon_effort_target[env_ids] = 0.0
       self.site_effort_target[env_ids] = 0.0
 
+  def clear_state_masked(self, mask: torch.Tensor) -> None:
+    """``clear_state`` for the worlds selected by a boolean ``[num_envs]`` mask."""
+    if self.is_actuated:
+      for target in (
+        self.joint_pos_target,
+        self.joint_vel_target,
+        self.joint_effort_target,
+        self.tendon_len_target,
+        self.tendon_vel_target,
+        self.tendon_effort_target,
+        self.site_effort_target,
+      ):
+        fill_rows_(target, mask, 0.0)
+
   def _resolve_env_ids(
-    self, env_ids: torch.Tensor | slice | None
-  ) -> torch.Tensor | slice:
+    self, env_ids: torch.Tensor | slice | EnvMask | None
+  ) -> torch.Tensor | slice | EnvMask:
     """Convert env_ids to consistent indexing format."""
     if env_ids is None:
       return slice(None)
     if isinstance(env_ids, torch.Tensor):
       return env_ids[:, None]
     return env_ids
+
+  @staticmethod
+  def _put(
+    field: torch.Tensor,
+    env_ids: torch.Tensor | slice | EnvMask,
+    cols: torch.Tensor | slice,
+    value: torch.Tensor,
+  ) -> None:
+    """``field[env_ids, cols] = value``; an ``EnvMask`` takes full-batch ``value``."""
+    if isinstance(env_ids, EnvMask):
+      field[:, cols] = where_rows(env_ids.mask, value, field[:, cols])
+    else:
+      field[env_ids, cols] = value
+
+  @staticmethod
+  def _get(
+    field: torch.Tensor,
+    env_ids: torch.Tensor | slice | EnvMask,
+    cols: torch.Tensor | slice,
+  ) -> torch.Tensor:
+    """``field[env_ids, cols]``; an ``EnvMask`` reads every world."""
+    if isinstance(env_ids, EnvMask):
+      return field[:, cols]
+    return field[env_ids, cols]
 
   def _joint_dof_field(self, field_name: str) -> torch.Tensor:
     """Return a generalized-force field sliced to this entity's joint DoFs."""

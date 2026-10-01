@@ -30,6 +30,7 @@ import torch
 
 from mjlab.entity import Entity
 from mjlab.sensor.sensor import Sensor, SensorCfg
+from mjlab.utils.masking import fill_rows_
 
 _CONTACT_DATA_MAP = {
   "found": 0,
@@ -241,6 +242,8 @@ class ContactSensor(Sensor[ContactData]):
     self._device: str | None = None
     self._air_time_state: _AirTimeState | None = None
     self._history_state: dict[str, torch.Tensor] | None = None
+    # Set by a whole-step CUDA-graph owner; see ``_update_history``.
+    self.inplace_history = False
 
   @property
   def primary_names(self) -> list[str]:
@@ -364,6 +367,20 @@ class ContactSensor(Sensor[ContactData]):
       for buf in self._history_state.values():
         buf[env_ids] = 0.0
 
+  def reset_masked(self, mask: torch.Tensor) -> None:
+    super().reset_masked(mask)
+    if self._air_time_state is not None:
+      for buf in (
+        self._air_time_state.current_air_time,
+        self._air_time_state.last_air_time,
+        self._air_time_state.current_contact_time,
+        self._air_time_state.last_contact_time,
+      ):
+        fill_rows_(buf, mask, 0.0)
+    if self._history_state is not None:
+      for buf in self._history_state.values():
+        fill_rows_(buf, mask, 0.0)
+
   def update(self, dt: float) -> None:
     super().update(dt)
     if self._air_time_state is not None:
@@ -485,22 +502,32 @@ class ContactSensor(Sensor[ContactData]):
     )
 
   def _update_history(self) -> None:
-    """Roll history buffer and insert current contact data at index 0."""
+    """Roll history buffer and insert current contact data at index 0.
+
+    With ``inplace_history`` the roll writes into the existing buffers instead of
+    rebinding them. A captured CUDA graph reads the buffer that existed at capture
+    time, so a rebinding roll would make every replay read a stale copy.
+    """
     assert self._history_state is not None
 
     contact_data = self._extract_sensor_data()
 
-    if "force" in self._history_state and contact_data.force is not None:
-      self._history_state["force"] = self._history_state["force"].roll(1, dims=2)
-      self._history_state["force"][:, :, 0, :] = contact_data.force
-
-    if "torque" in self._history_state and contact_data.torque is not None:
-      self._history_state["torque"] = self._history_state["torque"].roll(1, dims=2)
-      self._history_state["torque"][:, :, 0, :] = contact_data.torque
-
-    if "dist" in self._history_state and contact_data.dist is not None:
-      self._history_state["dist"] = self._history_state["dist"].roll(1, dims=2)
-      self._history_state["dist"][:, :, 0] = contact_data.dist
+    for key, value in (
+      ("force", contact_data.force),
+      ("torque", contact_data.torque),
+      ("dist", contact_data.dist),
+    ):
+      if key not in self._history_state or value is None:
+        continue
+      if self.inplace_history:
+        buf = self._history_state[key]
+        buf.copy_(buf.roll(1, dims=2))
+      else:
+        buf = self._history_state[key] = self._history_state[key].roll(1, dims=2)
+      if key == "dist":
+        buf[:, :, 0] = value
+      else:
+        buf[:, :, 0, :] = value
 
   def _resolve_primary_names(
     self, entities: dict[str, Entity], match: ContactMatch

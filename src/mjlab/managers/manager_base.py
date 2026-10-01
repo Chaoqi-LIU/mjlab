@@ -86,6 +86,22 @@ class ManagerTermBase:
     del env_ids  # Unused.
     pass
 
+  def reset_masked(self, mask: torch.Tensor) -> Any:
+    """Reset the worlds selected by a boolean ``[num_envs]`` mask, without host syncs.
+
+    A term whose ``reset`` does nothing needs nothing here. A stateful term must
+    override this; the default refuses rather than silently skip its reset.
+    """
+    del mask  # Unused.
+    if (
+      type(self).reset is not ManagerTermBase.reset
+      and type(self).reset_masked is ManagerTermBase.reset_masked
+    ):
+      raise NotImplementedError(
+        f"{type(self).__name__} overrides reset() but has no reset_masked(); "
+        "it cannot run in a masked (CUDA-graph) reset"
+      )
+
   def __call__(self, *args, **kwargs) -> Any:
     """Returns the value of the term required by the manager."""
     raise NotImplementedError
@@ -119,6 +135,11 @@ class ManagerBase(abc.ABC):
   def reset(self, env_ids: torch.Tensor) -> dict[str, Any]:
     """Resets the manager and returns logging info for the current step."""
     del env_ids  # Unused.
+    return {}
+
+  def reset_masked(self, mask: torch.Tensor) -> dict[str, Any]:
+    """Masked ``reset``; logs are ``{key: (device value, device valid flag)}``."""
+    del mask  # Unused.
     return {}
 
   def _check_term_shape(self, term_name: str, value: torch.Tensor) -> None:

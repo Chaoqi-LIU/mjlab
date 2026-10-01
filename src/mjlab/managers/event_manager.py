@@ -12,6 +12,7 @@ import torch
 from prettytable import PrettyTable
 
 from mjlab.managers.manager_base import ManagerBase, ManagerTermBaseCfg
+from mjlab.utils.masking import EnvMask, assign_rows_
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
@@ -236,6 +237,39 @@ class EventManager(ManagerBase):
           )
           self._interval_term_time_left[index][ids] = sampled_interval
     return {}
+
+  def reset_masked(self, mask: torch.Tensor) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    """Masked ``reset``: only class terms with state; interval timers are unsupported."""
+    if "interval" in self._mode_term_cfgs:
+      raise NotImplementedError("interval events do not support masked resets")
+    for mode_cfg in self._mode_class_term_cfgs.values():
+      for term_cfg in mode_cfg:
+        term_cfg.func.reset_masked(mask)
+    return {}
+
+  def apply_reset_masked(self, mask: torch.Tensor, global_env_step_count: torch.Tensor) -> None:
+    """Fixed-shape ``apply(mode="reset")`` for the worlds selected by a boolean mask.
+
+    Each term is called with an ``EnvMask`` and must declare
+    ``supports_env_mask = True``; it draws a full batch and writes only masked rows.
+    ``global_env_step_count`` is a device scalar.
+    """
+    env_mask = EnvMask(mask)
+    for index, term_cfg in enumerate(self._mode_term_cfgs.get("reset", ())):
+      func = term_cfg.func
+      if not getattr(func, "supports_env_mask", False):
+        raise NotImplementedError(
+          f"reset event {type(func).__name__} does not support masked resets "
+          "(declare supports_env_mask = True)"
+        )
+      if term_cfg.min_step_count_between_reset != 0:
+        raise NotImplementedError("min_step_count_between_reset needs a masked trigger")
+      if getattr(func, "recompute", RecomputeLevel.none) != RecomputeLevel.none:
+        raise NotImplementedError("events that recompute model constants cannot be masked")
+      last_step = self._reset_term_last_triggered_step_id[index]
+      assign_rows_(last_step, mask, global_env_step_count.to(last_step.dtype))
+      self._reset_term_last_triggered_once[index] |= mask
+      func(self._env, env_mask, **term_cfg.params)
 
   def apply(
     self,

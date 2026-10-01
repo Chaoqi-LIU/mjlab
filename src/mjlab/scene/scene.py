@@ -193,6 +193,13 @@ class Scene:
     for sensor in self._sensors.values():
       sensor.reset(env_ids)
 
+  def reset_masked(self, mask: torch.Tensor) -> None:
+    """``reset`` for the worlds selected by a boolean ``[num_envs]`` tensor."""
+    for ent in self._entities.values():
+      ent.reset_masked(mask)
+    for sensor in self._sensors.values():
+      sensor.reset_masked(mask)
+
   def update(self, dt: float) -> None:
     for ent in self._entities.values():
       ent.update(dt)

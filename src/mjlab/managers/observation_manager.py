@@ -10,6 +10,7 @@ from prettytable import PrettyTable
 
 from mjlab.managers.manager_base import ManagerBase, ManagerTermBaseCfg
 from mjlab.utils.buffers import CircularBuffer, DelayBuffer
+from mjlab.utils.masking import where_rows
 from mjlab.utils.noise import noise_cfg, noise_model
 from mjlab.utils.noise.noise_cfg import NoiseCfg, NoiseModelCfg
 
@@ -257,6 +258,47 @@ class ObservationManager(ManagerBase):
       for mod in group_mods.values():
         mod.reset(env_ids=env_ids)
     return {}
+
+  def reset_masked(self, mask: torch.Tensor) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    """Masked ``reset``; delay, history and noise-model state cannot be masked."""
+    self._obs_buffer = None
+    for group_name in self._group_obs_term_names:
+      if (
+        self._group_obs_term_delay_buffer[group_name]
+        or self._group_obs_term_history_buffer[group_name]
+      ):
+        raise NotImplementedError(
+          "observation delay and history buffers do not support masked resets"
+        )
+    for group_cfg in self._group_obs_class_term_cfgs.values():
+      for term_cfg in group_cfg:
+        term_cfg.func.reset_masked(mask)
+    for group_mods in self._group_obs_class_instances.values():
+      if group_mods:
+        raise NotImplementedError("observation noise models do not support masked resets")
+    return {}
+
+  def compute_masked(
+    self,
+    mask: torch.Tensor,
+    previous: dict[str, torch.Tensor | dict[str, torch.Tensor]],
+  ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
+    """Reset-path ``compute``: recompute every world, keep ``previous`` elsewhere.
+
+    The legacy reset path observes only the reset worlds and leaves the other
+    rows at the step's observation. Here every term evaluates all worlds (a fixed
+    shape) and the rows outside ``mask`` are restored from ``previous``, the
+    observations of the preceding pass.
+    """
+    fresh = self.compute(update_history=True)
+
+    def merge(new, old):
+      if isinstance(new, dict):
+        return {key: merge(value, old[key]) for key, value in new.items()}
+      return where_rows(mask, new, old)
+
+    self._obs_buffer = {group: merge(fresh[group], previous[group]) for group in fresh}
+    return self._obs_buffer
 
   def _check_and_handle_nans(
     self, tensor: torch.Tensor, context: str, policy: str

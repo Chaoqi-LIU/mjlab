@@ -10,6 +10,7 @@ import torch
 from mjlab.actuator.actuator import TransmissionType
 from mjlab.managers.action_manager import ActionTerm, ActionTermCfg
 from mjlab.utils.lab_api.string import resolve_matching_names_values
+from mjlab.utils.masking import fill_rows_
 
 if TYPE_CHECKING:
   from mjlab.entity import Entity
@@ -165,6 +166,17 @@ class BaseAction(ActionTerm):
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
     """Reset raw actions to zero for specified environments."""
     self._raw_actions[env_ids] = 0.0
+
+  def reset_masked(self, mask: torch.Tensor) -> None:
+    """Reset raw actions to zero for the worlds selected by a boolean mask."""
+    if (
+      type(self).reset is not BaseAction.reset
+      and type(self).reset_masked is BaseAction.reset_masked
+    ):
+      raise NotImplementedError(
+        f"{type(self).__name__} overrides reset() but has no reset_masked()"
+      )
+    fill_rows_(self._raw_actions, mask, 0.0)
 
 
 ##

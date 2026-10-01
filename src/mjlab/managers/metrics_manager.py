@@ -10,6 +10,7 @@ import torch
 from prettytable import PrettyTable
 
 from mjlab.managers.manager_base import ManagerBase, ManagerTermBaseCfg
+from mjlab.utils.masking import fill_rows_, mean_log
 
 if TYPE_CHECKING:
   from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
@@ -156,6 +157,32 @@ class MetricsManager(ManagerBase):
 
     return extras
 
+  def reset_masked(
+    self, mask: torch.Tensor
+  ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    extras = {}
+    safe_counts = torch.clamp(self._step_count.float(), min=1.0)
+    for idx, key in enumerate(self._episode_sums):
+      reduce = self._term_cfgs[idx].reduce
+      if reduce == "max":
+        extras["Episode_Metrics/" + key] = mean_log(self._episode_max[key], mask)
+        fill_rows_(self._episode_max[key], mask, float("-inf"))
+      elif reduce == "last":
+        extras["Episode_Metrics/" + key] = mean_log(self._step_values[:, idx], mask)
+      elif reduce == "sum":
+        extras["Episode_Metrics/" + key] = mean_log(self._episode_sums[key], mask)
+      else:
+        extras["Episode_Metrics/" + key] = mean_log(
+          self._episode_sums[key] / safe_counts, mask
+        )
+      fill_rows_(self._episode_sums[key], mask, 0.0)
+    fill_rows_(self._step_count, mask, 0)
+    for buf in self._substep_accum:
+      fill_rows_(buf, mask, 0.0)
+    for term_cfg in self._class_term_cfgs:
+      term_cfg.func.reset_masked(mask)
+    return extras
+
   def compute_substep(self) -> None:
     """Accumulate per-substep metric values inside the decimation loop.
 
@@ -240,6 +267,9 @@ class NullMetricsManager:
     return []
 
   def reset(self, env_ids: torch.Tensor | None = None) -> dict[str, float]:
+    return {}
+
+  def reset_masked(self, mask: torch.Tensor) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
     return {}
 
   def compute_substep(self) -> None:

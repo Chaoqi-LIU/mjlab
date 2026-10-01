@@ -1,3 +1,4 @@
+import contextlib
 import math
 from dataclasses import dataclass, field
 from typing import Any
@@ -40,6 +41,7 @@ from mjlab.scene.scene import SceneCfg
 from mjlab.sim import SimulationCfg
 from mjlab.sim.sim import Simulation
 from mjlab.utils import random as random_utils
+from mjlab.utils.masking import fill_rows_
 from mjlab.utils.logging import print_info
 from mjlab.utils.spaces import Box
 from mjlab.utils.spaces import Dict as DictSpace
@@ -185,7 +187,15 @@ class ManagerBasedRlEnv:
     self.cfg = cfg
     if self.cfg.seed is not None:
       self.cfg.seed = self.seed(self.cfg.seed)
+    self._in_program = False
+    self._static_program = False
     self._sim_step_counter = 0
+    # Dedicated stream for masked resets: a pure function of the seed, independent
+    # of every other consumer of the global generator.
+    self.reset_generator = torch.Generator(device=device)
+    self.seed_reset_generator(
+      self.cfg.seed if self.cfg.seed is not None else int(torch.initial_seed())
+    )
     self.extras = {}
     self.obs_buf = {}
     self._manual_reset_pending = torch.zeros(
@@ -289,6 +299,84 @@ class ManagerBasedRlEnv:
     """Get the unwrapped environment (base case for wrapper chains)."""
     return self
 
+  @property
+  def common_step_counter(self) -> int:
+    """Control steps taken (host value); unavailable inside a fixed-shape program.
+
+    A program that is captured in a CUDA graph would freeze this host integer at
+    capture time, so reading it there raises. Use ``step_clock`` instead.
+    """
+    if self._in_program:
+      raise RuntimeError(
+        "common_step_counter is a host value; a fixed-shape program must read "
+        "the device clock env.step_clock"
+      )
+    return self._common_step_counter
+
+  @common_step_counter.setter
+  def common_step_counter(self, value: int) -> None:
+    self._common_step_counter = int(value)
+    if self._static_program:
+      self.step_clock.fill_(self._common_step_counter)
+
+  @property
+  def in_program(self) -> bool:
+    """Whether a fixed-shape, host-synchronization-free program is executing."""
+    return self._in_program
+
+  @contextlib.contextmanager
+  def program(self):
+    """Run the body as the fixed-shape program (eagerly or under a CUDA-graph capture).
+
+    Inside it, host counters are unreadable, resets are masked, and code that would
+    otherwise validate with a host read must latch the failure on the device.
+    """
+    if not self._static_program:
+      raise RuntimeError("call prepare_static_program() before running a program")
+    if self._in_program:
+      raise RuntimeError("fixed-shape programs do not nest")
+    self._in_program = True
+    try:
+      yield
+    finally:
+      self._in_program = False
+
+  def prepare_static_program(self) -> None:
+    """Enable what a fixed-shape program needs; idempotent.
+
+    Creates the device step clock, makes contact-sensor histories roll in place
+    (a captured graph would otherwise read a stale rebound buffer) and refuses
+    configurations that cannot be masked.
+    """
+    if self._static_program:
+      return
+    if self.cfg.auto_reset:
+      raise RuntimeError("fixed-shape programs own resets: set auto_reset=False")
+    if not isinstance(self.curriculum_manager, NullCurriculumManager):
+      raise NotImplementedError("curriculum does not support masked resets")
+    if not isinstance(self.recorder_manager, NullRecorderManager):
+      raise NotImplementedError("recorders do not support masked resets")
+    if "interval" in self.event_manager.available_modes:
+      raise NotImplementedError("interval events do not support masked resets")
+    self.step_clock = torch.full(
+      (), self._common_step_counter, dtype=torch.long, device=self.device
+    )
+    for sensor in self.scene.sensors.values():
+      if hasattr(sensor, "inplace_history"):
+        sensor.inplace_history = True
+    self._static_program = True
+
+  def advance_host_clock(self, steps: int = 1) -> None:
+    """Advance the host counters after a program ran ``steps`` control steps."""
+    if self._in_program:
+      raise RuntimeError("the host clock advances outside the program")
+    self._common_step_counter += steps
+    self._sim_step_counter += steps * self.cfg.decimation
+
+  def seed_reset_generator(self, seed: int) -> None:
+    """Restart the masked-reset stream from ``seed``."""
+    self.reset_generator.manual_seed(int(seed) + 1_000_003)
+
   # Methods.
 
   def setup_manager_visualizers(self) -> None:
@@ -383,6 +471,28 @@ class ManagerBasedRlEnv:
     self.recorder_manager.record_post_reset(env_ids)
     return self.obs_buf, self.extras
 
+  def reset_masked(self, mask: torch.Tensor) -> tuple[types.VecEnvObs, dict]:
+    """Reset the worlds selected by a boolean ``[num_envs]`` tensor.
+
+    The fixed-shape counterpart of ``reset(env_ids=...)`` for a program that is
+    captured in a CUDA graph: it always runs the same work, whether zero or all
+    worlds are selected, and never reads the device on the host. Randomness comes
+    from ``reset_generator`` and is drawn for every world; rows outside ``mask``
+    keep their state and, in the returned observations, the preceding step's rows.
+    Logs are ``{key: (value, valid)}`` device pairs: ``valid`` is false on a call
+    that reset no world, where the scoped reset would not have logged the key.
+    """
+    if not self._static_program:
+      raise RuntimeError("call prepare_static_program() before reset_masked()")
+    self.extras["log"] = dict()
+    self._reset_idx_masked(mask)
+    self.scene.write_data_to_sim()
+    self.sim.forward()
+    self.command_manager.compute_masked(0.0, mask)
+    self.sim.sense()
+    self.obs_buf = self.observation_manager.compute_masked(mask, self.obs_buf)
+    return self.obs_buf, self.extras
+
   def step(self, action: torch.Tensor) -> types.VecEnvStepReturn:
     """Run one environment step: apply actions, simulate, compute RL signals.
 
@@ -424,7 +534,12 @@ class ManagerBasedRlEnv:
       etc.) in the same function that writes state (``write_root_state_to_sim``,
       ``write_joint_state_to_sim``, etc.). See :ref:`faq` for details.
     """
-    if not self.cfg.auto_reset and torch.any(self._manual_reset_pending):
+    program = self._in_program
+    if (
+      not program
+      and not self.cfg.auto_reset
+      and torch.any(self._manual_reset_pending)
+    ):
       pending_ids = self._manual_reset_pending.nonzero(as_tuple=False).squeeze(-1)
       raise RuntimeError(
         f"Environments {pending_ids.cpu().tolist()} must be reset via "
@@ -435,7 +550,8 @@ class ManagerBasedRlEnv:
     self.action_manager.process_action(action.to(self.device))
 
     for _ in range(self.cfg.decimation):
-      self._sim_step_counter += 1
+      if not program:
+        self._sim_step_counter += 1
       self.action_manager.apply_action()
       self.scene.write_data_to_sim()
       self.sim.step()
@@ -444,7 +560,10 @@ class ManagerBasedRlEnv:
 
     # Update env counters.
     self.episode_length_buf += 1
-    self.common_step_counter += 1
+    if program:
+      self.step_clock.add_(1)  # The host clock follows via advance_host_clock().
+    else:
+      self.common_step_counter += 1
 
     # Check terminations and compute rewards.
     # NOTE: Derived quantities (xpos, xquat, ...) are stale by one physics
@@ -465,7 +584,12 @@ class ManagerBasedRlEnv:
       self.event_manager.apply(mode="interval", dt=self.step_dt)
 
     # Reset envs that terminated/timed-out and log the episode info.
-    reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+    if program:
+      # Fixed shape: no index vector, hence no host synchronization. The owner of
+      # the program resets exactly these worlds with reset_masked().
+      reset_env_ids = None
+    else:
+      reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
     if self.cfg.auto_reset and len(reset_env_ids) > 0:
       self.recorder_manager.record_pre_reset(reset_env_ids)
       self._reset_idx(reset_env_ids)
@@ -490,7 +614,9 @@ class ManagerBasedRlEnv:
     self.sim.sense()
     self.obs_buf = self.observation_manager.compute(update_history=True)
 
-    if self.cfg.auto_reset and len(reset_env_ids) > 0:
+    if program:
+      self._manual_reset_pending |= self.reset_buf
+    elif self.cfg.auto_reset and len(reset_env_ids) > 0:
       self.recorder_manager.record_post_reset(reset_env_ids)
     elif len(reset_env_ids) > 0:
       self._manual_reset_pending[reset_env_ids] = True
@@ -576,6 +702,26 @@ class ManagerBasedRlEnv:
 
     self.observation_space = batch_space(self.single_observation_space, self.num_envs)
     self.action_space = batch_space(self.single_action_space, self.num_envs)
+
+  def _reset_idx_masked(self, mask: torch.Tensor) -> None:
+    """``_reset_idx`` for a boolean mask; the order is the same."""
+    self.sim.reset_masked(mask)
+    self.scene.reset_masked(mask)
+
+    if "reset" in self.event_manager.available_modes:
+      self.event_manager.apply_reset_masked(mask, self.step_clock)
+
+    # NOTE: This is order sensitive.
+    log = self.extras["log"]
+    log.update(self.observation_manager.reset_masked(mask))
+    log.update(self.action_manager.reset_masked(mask))
+    log.update(self.reward_manager.reset_masked(mask))
+    log.update(self.metrics_manager.reset_masked(mask))
+    log.update(self.command_manager.reset_masked(mask))
+    log.update(self.event_manager.reset_masked(mask))
+    log.update(self.termination_manager.reset_masked(mask))
+    fill_rows_(self.episode_length_buf, mask, 0)
+    self._manual_reset_pending &= ~mask
 
   def _reset_idx(self, env_ids: torch.Tensor | None = None) -> None:
     self.curriculum_manager.compute(env_ids=env_ids)

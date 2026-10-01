@@ -12,6 +12,7 @@ import torch
 from prettytable import PrettyTable
 
 from mjlab.managers.manager_base import ManagerBase, ManagerTermBase
+from mjlab.utils.masking import assign_rows_, fill_rows_, mean_log
 
 if TYPE_CHECKING:
   import viser
@@ -107,6 +108,58 @@ class CommandTerm(ManagerTermBase):
     self.command_counter[env_ids] = 0
     self._resample(env_ids)
     return extras
+
+  def reset_masked(
+    self, mask: torch.Tensor
+  ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    """``reset`` for the worlds selected by a boolean ``[num_envs]`` mask."""
+    extras = {}
+    for metric_name, metric_value in self.metrics.items():
+      extras[metric_name] = mean_log(metric_value, mask)
+      fill_rows_(metric_value, mask, 0.0)
+    fill_rows_(self.command_counter, mask, 0)
+    self._resample_masked(mask)
+    return extras
+
+  def compute_masked(
+    self, dt: float, mask: torch.Tensor | None = None
+  ) -> None:
+    """Fixed-shape ``compute``; ``mask`` scopes a reset-path call, ``None`` is per step.
+
+    Timers that expire resample through the masked path, which draws a full batch
+    each call, so a term whose timers can never expire should override this.
+    """
+    self._update_metrics()
+    if mask is None:
+      self.time_left -= dt
+      expired = self.time_left <= 0.0
+    else:
+      self.time_left -= torch.where(mask, dt, 0.0)
+      expired = mask & (self.time_left <= 0.0)
+    self._resample_masked(expired)
+    self._update_command_masked(mask)
+
+  def _resample_masked(self, mask: torch.Tensor) -> None:
+    """Draw a full batch of timers and commands; keep them for the masked worlds."""
+    low, high = self.cfg.resampling_time_range
+    fresh = torch.empty_like(self.time_left).uniform_(
+      low, high, generator=self._env.reset_generator
+    )
+    assign_rows_(self.time_left, mask, fresh)
+    self._resample_command_masked(mask)
+    self.command_counter += mask.to(self.command_counter.dtype)
+
+  def _resample_command_masked(self, mask: torch.Tensor) -> None:
+    """Masked ``_resample_command``: draw for every world, keep the masked rows."""
+    raise NotImplementedError(
+      f"{type(self).__name__} does not support masked (CUDA-graph) resets"
+    )
+
+  def _update_command_masked(self, mask: torch.Tensor | None) -> None:
+    """Masked ``_update_command``: ``None`` updates every world."""
+    raise NotImplementedError(
+      f"{type(self).__name__} does not support masked (CUDA-graph) resets"
+    )
 
   def compute(
     self, dt: float | torch.Tensor, env_ids: torch.Tensor | None = None
@@ -284,9 +337,22 @@ class CommandManager(ManagerBase):
         extras[f"Metrics/{name}/{metric_name}"] = metric_value
     return extras
 
+  def reset_masked(
+    self, mask: torch.Tensor
+  ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    extras = {}
+    for name, term in self._terms.items():
+      for metric_name, metric_value in term.reset_masked(mask).items():
+        extras[f"Metrics/{name}/{metric_name}"] = metric_value
+    return extras
+
   def compute(self, dt: float | torch.Tensor, env_ids: torch.Tensor | None = None):
     for term in self._terms.values():
       term.compute(dt, env_ids)
+
+  def compute_masked(self, dt: float, mask: torch.Tensor | None = None) -> None:
+    for term in self._terms.values():
+      term.compute_masked(dt, mask)
 
   def get_command(self, name: str) -> torch.Tensor:
     return self._terms[name].command
@@ -358,9 +424,15 @@ class NullCommandManager:
   def reset(self, env_ids: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
     return {}
 
+  def reset_masked(self, mask: torch.Tensor) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    return {}
+
   def compute(
     self, dt: float | torch.Tensor, env_ids: torch.Tensor | None = None
   ) -> None:
+    pass
+
+  def compute_masked(self, dt: float, mask: torch.Tensor | None = None) -> None:
     pass
 
   def get_command(self, name: str) -> None:

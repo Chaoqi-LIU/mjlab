@@ -412,6 +412,21 @@ class Actuator(ABC, Generic[ActuatorCfgT]):
 
   # Optional methods.
 
+  def reset_masked(self, mask: torch.Tensor) -> None:
+    """Reset actuator state for the worlds selected by a boolean ``[num_envs]`` mask.
+
+    Stateless actuators need nothing. Subclasses that override ``reset`` or use a
+    delay buffer must provide their own masked version.
+    """
+    del mask
+    if self._delay_buffer is not None or (
+      type(self).reset is not Actuator.reset
+      and type(self).reset_masked is Actuator.reset_masked
+    ):
+      raise NotImplementedError(
+        f"{type(self).__name__} does not support masked (CUDA-graph) resets"
+      )
+
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
     """Reset actuator state for specified environments.
 

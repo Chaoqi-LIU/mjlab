@@ -15,6 +15,7 @@ from mjlab.utils.lab_api.math import (
   quat_mul,
   sample_uniform,
 )
+from mjlab.utils.masking import EnvMask
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
@@ -135,6 +136,10 @@ def reset_root_state_uniform(
     velocity_range: Velocity range (only used for floating-base entities).
     asset_cfg: Asset configuration.
   """
+  if isinstance(env_ids, EnvMask):
+    _reset_root_state_masked(env, env_ids, pose_range, velocity_range, asset_cfg)
+    return
+
   env_ids = resolve_env_ids(env, env_ids)
 
   asset: Entity = env.scene[asset_cfg.name]
@@ -188,6 +193,62 @@ def reset_root_state_uniform(
   )
 
   asset.write_root_link_velocity_to_sim(velocities, env_ids=env_ids)
+
+
+def _sample_se3_range_masked(
+  range_dict: dict[str, tuple[float, float]] | None, env: ManagerBasedRlEnv
+) -> torch.Tensor:
+  """``_sample_se3_range`` for every world, from the environment's reset generator.
+
+  Zero-width ranges need no draw; the others draw a full batch every call.
+  """
+  range_dict = range_dict or {}
+  ranges = tuple(range_dict.get(key, (0.0, 0.0)) for key in _SE3_KEYS)
+  # Built once, outside any capture: a host-to-device copy cannot be recorded.
+  cache = env.__dict__.setdefault("_se3_bounds_cache", {})
+  if ranges not in cache:
+    cache[ranges] = (
+      torch.tensor([r[0] for r in ranges], device=env.device),
+      torch.tensor([r[1] for r in ranges], device=env.device),
+      any(r[1] != r[0] for r in ranges),
+    )
+  low, high, random = cache[ranges]
+  samples = low.expand(env.num_envs, 6)
+  if random:
+    unit = torch.rand(
+      (env.num_envs, 6), device=env.device, generator=env.reset_generator
+    )
+    samples = low + (high - low) * unit
+  return samples
+
+
+def _reset_root_state_masked(
+  env: ManagerBasedRlEnv,
+  env_ids: EnvMask,
+  pose_range: dict[str, tuple[float, float]],
+  velocity_range: dict[str, tuple[float, float]] | None,
+  asset_cfg: SceneEntityCfg,
+) -> None:
+  """Floating-base ``reset_root_state_uniform`` for the worlds selected by a mask."""
+  asset: Entity = env.scene[asset_cfg.name]
+  if asset.is_fixed_base:
+    raise NotImplementedError("masked root reset supports floating-base entities only")
+  default_root_state = asset.data.default_root_state
+  assert default_root_state is not None
+  pose_samples = _sample_se3_range_masked(pose_range, env)
+  positions = default_root_state[:, 0:3] + pose_samples[:, 0:3] + env.scene.env_origins
+  orientations_delta = quat_from_euler_xyz(
+    pose_samples[:, 3], pose_samples[:, 4], pose_samples[:, 5]
+  )
+  orientations = quat_mul(default_root_state[:, 3:7], orientations_delta)
+  velocities = default_root_state[:, 7:13] + _sample_se3_range_masked(velocity_range, env)
+  asset.write_root_link_pose_to_sim(
+    torch.cat([positions, orientations], dim=-1), env_ids=env_ids
+  )
+  asset.write_root_link_velocity_to_sim(velocities, env_ids=env_ids)
+
+
+reset_root_state_uniform.supports_env_mask = True  # type: ignore[attr-defined]
 
 
 def reset_root_state_from_flat_patches(

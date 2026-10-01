@@ -10,6 +10,7 @@ import torch
 from prettytable import PrettyTable
 
 from mjlab.managers.manager_base import ManagerBase, ManagerTermBase
+from mjlab.utils.masking import fill_rows_
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
@@ -147,6 +148,13 @@ class ActionManager(ManagerBase):
     # Reset action terms.
     for term in self._terms.values():
       term.reset(env_ids=env_ids)
+    return {}
+
+  def reset_masked(self, mask: torch.Tensor) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    for buf in (self._prev_action, self._prev_prev_action, self._action):
+      fill_rows_(buf, mask, 0.0)
+    for term in self._terms.values():
+      term.reset_masked(mask)
     return {}
 
   def process_action(self, action: torch.Tensor) -> None:
