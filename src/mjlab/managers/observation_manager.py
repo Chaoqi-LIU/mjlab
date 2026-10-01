@@ -285,10 +285,13 @@ class ObservationManager(ManagerBase):
   ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
     """Reset-path ``compute``: recompute every world, keep ``previous`` elsewhere.
 
-    The legacy reset path observes only the reset worlds and leaves the other
-    rows at the step's observation. Here every term evaluates all worlds (a fixed
-    shape) and the rows outside ``mask`` are restored from ``previous``, the
-    observations of the preceding pass.
+    The scoped reset path scopes only the history and delay buffers; stateless terms
+    still evaluate every world, so a world that did not reset is returned with its
+    recomputed observation. Here every term also evaluates all worlds (a fixed
+    shape), and the rows outside ``mask`` are restored from ``previous``, the
+    observations of the preceding pass. For a world that did not reset the two are
+    equal except where the refresh forward between the passes changed a derived
+    quantity in its last bits.
     """
     fresh = self.compute(update_history=True)
 
